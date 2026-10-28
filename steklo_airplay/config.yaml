@@ -1,0 +1,22 @@
+name: Steklo AirPlay
+version: "1.0.0"
+slug: steklo_airplay
+description: Колонки AirPlay 2 для телевизоров с лаунчером «Стекло»
+url: https://github.com/cumonmycode/steklo-airplay
+arch:
+  - aarch64
+  - amd64
+  - armv7
+init: false
+# AirPlay 2 timing needs UDP 319/320 and mDNS on the home network
+host_network: true
+startup: services
+boot: auto
+options:
+  bridge_port: 7700
+  first_airplay_port: 7001
+  latency_offset_ms: -150
+schema:
+  bridge_port: port
+  first_airplay_port: port
+  latency_offset_ms: int(-2000,2000)
