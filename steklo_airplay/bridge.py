@@ -3,8 +3,10 @@
 
 Every TV running the Steklo launcher connects here and names its room. For each linked TV the bridge runs one
 shairport-sync AirPlay 2 receiver under that name (all of them share one nqptp and one Avahi) and passes the
-receiver's audio, track details and cover on to the TV. Buttons pressed on the TV go back to the iPhone as
-DACP remote commands. A speaker exists only while its TV is linked, so nobody plays music into a TV that is off.
+receiver's audio, track details and cover on to the TV. Buttons pressed on the TV reach the iPhone through
+shairport-sync's own remote control, which speaks AirPlay 2's event channel; each receiver gets a private D-Bus
+for it, since every shairport-sync claims the same bus name. A speaker exists only while its TV is linked, so
+nobody plays music into a TV that is off.
 """
 import asyncio
 import base64
@@ -14,8 +16,6 @@ import logging
 import os
 import re
 import struct
-import subprocess
-import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 OPTIONS_PATH = "/data/options.json"
@@ -33,7 +33,8 @@ MAX_METADATA_BUFFER = 8 * 1024 * 1024
 MAX_NAME = 40
 MAX_RECEIVERS = 8
 STOP_TIMEOUT_S = 5
-DACP_TIMEOUT_S = 5
+BUS_START_TIMEOUT_S = 5
+REMOTE_TIMEOUT_S = 5
 # shairport-sync releases audio this far ahead of its AirPlay time; the TV's own queue absorbs it
 BACKEND_BUFFER_S = 0.1
 DEFAULT_OPTIONS = {"bridge_port": 7700, "first_airplay_port": 7001, "latency_offset_ms": -150}
@@ -42,8 +43,11 @@ ITEM = re.compile(
     rb"<item><type>([0-9a-f]{8})</type><code>([0-9a-f]{8})</code><length>(\d+)</length>"
     rb"(?:\s*<data encoding=\"base64\">\s*([^<]*)</data>)?\s*</item>\s*"
 )
-# TV button -> DACP verb understood by the sending iPhone
-COMMANDS = {"previous": "previtem", "playpause": "playpause", "next": "nextitem"}
+# TV button -> shairport-sync's D-Bus remote-control method
+COMMANDS = {"previous": "Previous", "playpause": "PlayPause", "next": "Next"}
+REMOTE_SERVICE = "org.gnome.ShairportSync"
+REMOTE_PATH = "/org/gnome/ShairportSync"
+REMOTE_INTERFACE = "org.gnome.ShairportSync.RemoteControl"
 STATES = {"pbeg": "playing", "prsm": "playing", "pres": "playing", "paus": "paused", "pfls": "paused", "pend": "stopped"}
 TRACK_FIELDS = {"minm": "title", "asar": "artist", "asal": "album"}
 TRANSLIT = str.maketrans({
@@ -101,6 +105,8 @@ def shairport_config(name: str, port: int, metadata_pipe: str, latency_offset_ms
         '  mdns_backend = "avahi";\n'
         f"  audio_backend_buffer_desired_length_in_seconds = {BACKEND_BUFFER_S};\n"
         f"  audio_backend_latency_offset_in_seconds = {latency_offset_ms / 1000:.3f};\n"
+        '  dbus_service_bus = "session";\n'
+        '  mpris_service_bus = "session";\n'
         "};\n"
         "stdout = {\n"
         '  output_format = "S16_LE";\n'
@@ -115,14 +121,12 @@ def shairport_config(name: str, port: int, metadata_pipe: str, latency_offset_ms
     )
 
 
-def parse_dacp_browse(output: str, dacp_id: str) -> Optional[Tuple[str, int]]:
-    """Address and port of the sender's remote-control service in `avahi-browse -prt _dacp._tcp` output."""
-    wanted = f"itunes_ctrl_{dacp_id}".lower()
-    for line in output.splitlines():
-        fields = line.split(";")
-        if len(fields) >= 9 and fields[0] == "=" and fields[2] == "IPv4" and fields[3].lower() == wanted:
-            return fields[7], int(fields[8])
-    return None
+def remote_command(bus: str, method: str) -> List[str]:
+    """The dbus-send call that makes the receiver on [bus] skip or pause on the sending iPhone."""
+    return [
+        "dbus-send", f"--bus={bus}", "--print-reply", f"--reply-timeout={REMOTE_TIMEOUT_S * 1000}",
+        f"--dest={REMOTE_SERVICE}", REMOTE_PATH, f"{REMOTE_INTERFACE}.{method}",
+    ]
 
 
 class Receiver:
@@ -134,42 +138,59 @@ class Receiver:
         self.key = slug(name)
         self.meta_pipe = f"{RUN_DIR}/{self.key}.meta"
         self.conf = f"{RUN_DIR}/{self.key}.conf"
+        self.bus_socket = f"{RUN_DIR}/{self.key}.bus"
+        self.bus = f"unix:path={self.bus_socket}"
         self.latency_offset_ms = latency_offset_ms
         self.process: Optional[asyncio.subprocess.Process] = None
+        self.bus_daemon: Optional[asyncio.subprocess.Process] = None
         self.meta_fd = -1
         self.keep_fd = -1
-        self.dacp_id: Optional[str] = None
-        self.active_remote: Optional[str] = None
 
     async def start(self) -> None:
         with open(self.conf, "w", encoding="utf-8") as conf:
             conf.write(shairport_config(self.name, self.port, self.meta_pipe, self.latency_offset_ms))
-        if os.path.exists(self.meta_pipe):
-            os.unlink(self.meta_pipe)
+        for path in (self.meta_pipe, self.bus_socket):
+            if os.path.exists(path):
+                os.unlink(path)
         os.mkfifo(self.meta_pipe)
         self.meta_fd = os.open(self.meta_pipe, os.O_RDONLY | os.O_NONBLOCK)
         # A writer of our own keeps the pipe from reading as finished between shairport-sync's writes
         self.keep_fd = os.open(self.meta_pipe, os.O_WRONLY | os.O_NONBLOCK)
+        await self.start_bus()
         self.process = await asyncio.create_subprocess_exec(
             SHAIRPORT, "-c", self.conf, "-a", self.name, f"--port={self.port}",
             f"--nqptp-shared-memory-interface-name=/nqptp-{self.key}",
             stdout=asyncio.subprocess.PIPE,
+            env={**os.environ, "DBUS_SESSION_BUS_ADDRESS": self.bus},
         )
         log.info("AirPlay speaker «%s» up on port %d", self.name, self.port)
 
+    async def start_bus(self) -> None:
+        """A D-Bus of this speaker's own for its remote control; it prints its address once it listens."""
+        self.bus_daemon = await asyncio.create_subprocess_exec(
+            "dbus-daemon", "--session", f"--address={self.bus}", "--nofork", "--nopidfile", "--print-address",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        assert self.bus_daemon.stdout is not None
+        try:
+            await asyncio.wait_for(self.bus_daemon.stdout.readline(), BUS_START_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("D-Bus for «%s» is slow to start; the TV's buttons may not work", self.name)
+
     async def stop(self) -> None:
-        process, self.process = self.process, None
-        if process is not None and process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), STOP_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                process.kill()
+        for process in (self.process, self.bus_daemon):
+            if process is not None and process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), STOP_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    process.kill()
+        self.process = self.bus_daemon = None
         for fd in (self.keep_fd, self.meta_fd):
             if fd >= 0:
                 os.close(fd)
         self.meta_fd = self.keep_fd = -1
-        for path in (self.meta_pipe, self.conf):
+        for path in (self.meta_pipe, self.conf, self.bus_socket):
             if os.path.exists(path):
                 os.unlink(path)
         log.info("AirPlay speaker «%s» down", self.name)
@@ -244,10 +265,6 @@ async def pump_metadata(receiver: Receiver, writer: asyncio.StreamWriter) -> Non
                 await send(writer, COVER, data)
             elif code == "snam":
                 await send_event(writer, {"type": "session", "client": data.decode("utf-8", "replace")})
-            elif code == "daid":
-                receiver.dacp_id = data.decode("ascii", "replace")
-            elif code == "acre":
-                receiver.active_remote = data.decode("ascii", "replace")
             elif state_event(code) is not None:
                 if code == "pend":
                     track, sent_track = {}, {}
@@ -264,41 +281,33 @@ async def pings(writer: asyncio.StreamWriter) -> None:
         await send(writer, PING)
 
 
-def dacp_send(receiver: Receiver, verb: str) -> None:
-    """Asks the sending iPhone to skip or pause, as a DACP remote would. Runs off the event loop."""
-    if not receiver.dacp_id or not receiver.active_remote:
-        log.info("No remote-control details from the sender yet")
-        return
-    browse = subprocess.run(["avahi-browse", "-prt", "_dacp._tcp"], capture_output=True, text=True, timeout=DACP_TIMEOUT_S)
-    target = parse_dacp_browse(browse.stdout, receiver.dacp_id)
-    if target is None:
-        log.info("The sender does not announce remote control")
-        return
-    host, port = target
-    request = urllib.request.Request(
-        f"http://{host}:{port}/ctrl-int/1/{verb}",
-        headers={"Active-Remote": receiver.active_remote},
+async def remote_send(receiver: Receiver, method: str) -> None:
+    """Asks the sending iPhone to skip or pause through the receiver's own remote control."""
+    process = await asyncio.create_subprocess_exec(
+        *remote_command(receiver.bus, method), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        with urllib.request.urlopen(request, timeout=DACP_TIMEOUT_S):
-            pass
-    except OSError as error:
-        log.warning("Remote command %s failed: %s", verb, error)
+        _, error = await asyncio.wait_for(process.communicate(), REMOTE_TIMEOUT_S + 1)
+    except asyncio.TimeoutError:
+        process.kill()
+        log.warning("Remote %s for «%s» timed out", method, receiver.name)
+        return
+    if process.returncode != 0:
+        log.warning("Remote %s for «%s» failed: %s", method, receiver.name, error.decode("utf-8", "replace").strip())
 
 
 async def tv_commands(receiver: Receiver, reader: asyncio.StreamReader) -> None:
     """Button presses from the TV; the TV hanging up ends the session."""
-    loop = asyncio.get_running_loop()
     while True:
         line = await reader.readline()
         if not line:
             return
         try:
-            verb = COMMANDS.get(json.loads(line.decode("utf-8")).get("cmd", ""))
+            method = COMMANDS.get(json.loads(line.decode("utf-8")).get("cmd", ""))
         except (ValueError, AttributeError):
             continue
-        if verb:
-            await loop.run_in_executor(None, dacp_send, receiver, verb)
+        if method:
+            await remote_send(receiver, method)
 
 
 async def serve_tv(registry: Registry, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -347,7 +356,8 @@ async def main() -> None:
     os.makedirs(RUN_DIR, exist_ok=True)
     registry = Registry(options)
     server = await asyncio.start_server(
-        lambda reader, writer: serve_tv(registry, reader, writer), host="0.0.0.0", port=options["bridge_port"],
+        # No host: listen on IPv6 as well, since TVs may resolve the bridge to its IPv6 address first
+        lambda reader, writer: serve_tv(registry, reader, writer), host=None, port=options["bridge_port"],
     )
     log.info("Waiting for Steklo TVs on port %d", options["bridge_port"])
     async with server:

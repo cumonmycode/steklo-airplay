@@ -54,22 +54,19 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('pipe_name = "/run/steklo/kukhnya.meta";', conf)
         # A fixed device id would stop shairport-sync deriving a unique one per room
         self.assertNotIn("airplay_device_id", conf)
+        # Every receiver claims the same D-Bus name, so each one serves remote control on its own bus
+        self.assertIn('dbus_service_bus = "session";', conf)
+        self.assertIn('mpris_service_bus = "session";', conf)
 
-    def test_the_senders_remote_control_service_is_found_by_its_dacp_id(self):
-        output = "\n".join([
-            "+;end0;IPv4;iTunes_Ctrl_ABCD1234;_dacp._tcp;local",
-            "=;end0;IPv6;iTunes_Ctrl_ABCD1234;_dacp._tcp;local;iPhone.local;fe80::1;50122;",
-            "=;end0;IPv4;iTunes_Ctrl_FFFF0000;_dacp._tcp;local;iPad.local;192.168.1.40;50123;",
-            "=;end0;IPv4;iTunes_Ctrl_ABCD1234;_dacp._tcp;local;iPhone.local;192.168.1.33;50122;",
-        ])
+    def test_tv_buttons_call_the_receivers_remote_control_on_its_own_bus(self):
+        command = bridge.remote_command("unix:path=/run/steklo/kukhnya.bus", bridge.COMMANDS["next"])
 
-        self.assertEqual(("192.168.1.33", 50122), bridge.parse_dacp_browse(output, "abcd1234"))
-        self.assertIsNone(bridge.parse_dacp_browse(output, "00000000"))
-
-    def test_tv_buttons_map_to_dacp_verbs(self):
-        self.assertEqual("playpause", bridge.COMMANDS["playpause"])
-        self.assertEqual("nextitem", bridge.COMMANDS["next"])
-        self.assertEqual("previtem", bridge.COMMANDS["previous"])
+        self.assertEqual("dbus-send", command[0])
+        self.assertIn("--bus=unix:path=/run/steklo/kukhnya.bus", command)
+        self.assertIn("--dest=org.gnome.ShairportSync", command)
+        self.assertEqual(["/org/gnome/ShairportSync", "org.gnome.ShairportSync.RemoteControl.Next"], command[-2:])
+        self.assertEqual("PlayPause", bridge.COMMANDS["playpause"])
+        self.assertEqual("Previous", bridge.COMMANDS["previous"])
 
 
 if __name__ == "__main__":
