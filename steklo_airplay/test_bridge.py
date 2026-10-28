@@ -33,8 +33,14 @@ class BridgeTest(unittest.TestCase):
     def test_play_state_codes_become_state_events(self):
         self.assertEqual({"type": "state", "state": "playing"}, bridge.state_event("pbeg"))
         self.assertEqual({"type": "state", "state": "paused"}, bridge.state_event("paus"))
-        self.assertEqual({"type": "state", "state": "stopped"}, bridge.state_event("pend"))
         self.assertIsNone(bridge.state_event("pvol"))
+
+    def test_a_paused_session_keeps_its_player_until_the_session_ends(self):
+        # An AirPlay 2 sender can end the stream on pause; only the end of the active session stops the player
+        self.assertEqual({"type": "state", "state": "paused"}, bridge.state_event("pend"))
+        self.assertEqual({"type": "state", "state": "stopped"}, bridge.state_event("aend"))
+        conf = bridge.shairport_config("Кухня", 7001, "/run/steklo/kukhnya.meta", -150)
+        self.assertIn(f"active_state_timeout = {bridge.PAUSED_SESSION_S:.1f};", conf)
 
     def test_audio_is_passed_on_in_whole_stereo_frames(self):
         aligned, rest = bridge.whole_frames(b"\x01\x02\x03\x04\x05\x06")

@@ -48,7 +48,15 @@ COMMANDS = {"previous": "Previous", "playpause": "PlayPause", "next": "Next"}
 REMOTE_SERVICE = "org.gnome.ShairportSync"
 REMOTE_PATH = "/org/gnome/ShairportSync"
 REMOTE_INTERFACE = "org.gnome.ShairportSync.RemoteControl"
-STATES = {"pbeg": "playing", "prsm": "playing", "pres": "playing", "paus": "paused", "pfls": "paused", "pend": "stopped"}
+# An AirPlay 2 sender may end the stream while it stays paused, so only the end of the active session ("aend")
+# takes the player off the TV
+STATES = {
+    "pbeg": "playing", "prsm": "playing", "pres": "playing",
+    "paus": "paused", "pfls": "paused", "pend": "paused",
+    "aend": "stopped",
+}
+# How long a paused session keeps its player on the TV
+PAUSED_SESSION_S = 300
 TRACK_FIELDS = {"minm": "title", "asar": "artist", "asal": "album"}
 TRANSLIT = str.maketrans({
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
@@ -107,6 +115,9 @@ def shairport_config(name: str, port: int, metadata_pipe: str, latency_offset_ms
         f"  audio_backend_latency_offset_in_seconds = {latency_offset_ms / 1000:.3f};\n"
         '  dbus_service_bus = "session";\n'
         '  mpris_service_bus = "session";\n'
+        "};\n"
+        "sessioncontrol = {\n"
+        f"  active_state_timeout = {PAUSED_SESSION_S:.1f};\n"
         "};\n"
         "stdout = {\n"
         '  output_format = "S16_LE";\n'
@@ -266,7 +277,8 @@ async def pump_metadata(receiver: Receiver, writer: asyncio.StreamWriter) -> Non
             elif code == "snam":
                 await send_event(writer, {"type": "session", "client": data.decode("utf-8", "replace")})
             elif state_event(code) is not None:
-                if code == "pend":
+                log.info("«%s»: %s", receiver.name, code)
+                if code == "aend":
                     track, sent_track = {}, {}
                 await send_event(writer, state_event(code))
         # Title, artist and album arrive as separate items; one event per change keeps the TV calm
