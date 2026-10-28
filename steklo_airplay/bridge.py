@@ -54,7 +54,8 @@ REMOTE_TIMEOUT_S = 5
 START_CHECK_S = 0.5
 # shairport-sync releases audio this far ahead of its AirPlay time; the TV's own queue absorbs it
 BACKEND_BUFFER_S = 0.1
-DEFAULT_OPTIONS = {"bridge_port": 7700, "first_airplay_port": 7001, "latency_offset_ms": -150}
+DEFAULT_OPTIONS = {"bridge_port": 7700, "first_airplay_port": 7001, "latency_offset_ms": -150, "room_offsets": []}
+MAX_ROOM_OFFSET_MS = 500
 DEFAULT_NAME = "Телевизор"
 
 ITEM = re.compile(
@@ -149,6 +150,20 @@ def airplay_volume(level: float) -> float:
     """The AirPlay volume for a TV level from 0 to 1; a silent TV mutes the sender."""
     level = min(1.0, max(0.0, level))
     return AIRPLAY_MUTED if level == 0 else AIRPLAY_QUIETEST * (1.0 - level)
+
+
+def lead_ms(options: dict, room: str) -> int:
+    """How long after the bridge lets go of a frame the TV in [room] should play it.
+
+    shairport-sync releases audio this far ahead of its AirPlay time, so every TV playing on that schedule sounds
+    together with the others and with HomePods. A room offset makes up for delay Android cannot see, such as a TV's
+    own sound processing behind an HDMI stick; positive plays later.
+    """
+    offset = 0
+    for entry in options.get("room_offsets") or []:
+        if isinstance(entry, dict) and entry.get("room") == room and isinstance(entry.get("offset_ms"), int):
+            offset = max(-MAX_ROOM_OFFSET_MS, min(MAX_ROOM_OFFSET_MS, entry["offset_ms"]))
+    return max(0, round(BACKEND_BUFFER_S * 1000 - options["latency_offset_ms"] + offset))
 
 
 def whole_frames(buffer: bytes) -> Tuple[bytes, bytes]:
@@ -481,7 +496,7 @@ async def serve_tv(registry: Registry, reader: asyncio.StreamReader, writer: asy
         asyncio.ensure_future(tv_commands(receiver, reader)),
     ]
     try:
-        await send_event(writer, {"type": "receiver", "name": name})
+        await send_event(writer, {"type": "receiver", "name": name, "lead_ms": lead_ms(registry.options, name)})
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             if not task.cancelled() and task.exception() is not None:

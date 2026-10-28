@@ -106,6 +106,14 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(bridge.AIRPLAY_MUTED, bridge.airplay_volume(0.0))
         self.assertEqual(0.0, bridge.airplay_volume(1.7))
 
+    def test_every_tv_plays_at_the_airplay_time_with_its_room_offset(self):
+        options = dict(bridge.DEFAULT_OPTIONS, room_offsets=[{"room": "Кухня", "offset_ms": -40}, {"room": "Зал", "offset_ms": 9000}])
+
+        self.assertEqual(250, bridge.lead_ms(options, "Прихожая"))
+        self.assertEqual(210, bridge.lead_ms(options, "Кухня"))
+        self.assertEqual(250 + bridge.MAX_ROOM_OFFSET_MS, bridge.lead_ms(options, "Зал"))
+        self.assertEqual(350, bridge.lead_ms(dict(options, latency_offset_ms=-250), "Прихожая"))
+
     def test_tv_buttons_call_the_receivers_remote_control_on_its_own_bus(self):
         method, args = bridge.tv_command(b'{"cmd":"next"}\n')
         command = bridge.remote_command("unix:path=/run/steklo/kukhnya.bus", method, *args)
